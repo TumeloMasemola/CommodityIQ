@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 
-app = FastAPI(title="CommodityIQ API")
+app = FastAPI(title="TerraxIQ API")
 
 app.add_middleware(
     CORSMiddleware,
