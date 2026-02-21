@@ -4,12 +4,16 @@
 # In[1]:
 
 
+
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib
 import numpy as np
 import pandas as pd
+import requests
+import os
 from datetime import datetime, timedelta
 
 app = FastAPI(title="CommodityIQ API")
@@ -35,6 +39,16 @@ commodity_info = {
     'copper': {'name': 'Copper', 'unit': 'lb', 'currency': 'USD'},
 }
 
+# ============================================
+# API KEYS — set these in Railway Variables
+# ============================================
+GOLD_API_KEY = os.environ.get("GOLD_API_KEY")  # goldapi.io
+EIA_API_KEY = os.environ.get("EIA_API_KEY")    # eia.gov
+
+# ============================================
+# PYDANTIC MODELS
+# ============================================
+
 class PredictionRequest(BaseModel):
     commodity: str
     forecast_days: int = 30
@@ -54,22 +68,63 @@ class PredictionResponse(BaseModel):
 class DashboardResponse(BaseModel):
     commodities: list
 
+# ============================================
+# LIVE PRICE FETCHERS
+# ============================================
+
+def get_metals_price(symbol: str) -> float:
+    try:
+        response = requests.get(
+            f"https://www.goldapi.io/api/{symbol}/USD",
+            headers={"x-access-token": GOLD_API_KEY},
+            timeout=5
+        )
+        return float(response.json()['price'])
+    except:
+        return None
+
+def get_oil_price() -> float:
+    try:
+        url = f"https://api.eia.gov/v2/petroleum/pri/spt/data/?api_key={EIA_API_KEY}&frequency=daily&data[0]=value&sort[0][column]=period&sort[0][direction]=desc&length=1"
+        response = requests.get(url, timeout=5)
+        return float(response.json()['response']['data'][0]['value'])
+    except:
+        return None
+
 def get_current_price(commodity: str) -> float:
-    sample_prices = {
-        'gold': 3000,
+    fallback = {
+        'gold': 5040,
         'platinum': 980,
         'oil': 85.50,
         'copper': 4.50
     }
-    return sample_prices.get(commodity, 0)
+
+    if commodity == 'gold':
+        price = get_metals_price('XAU')
+    elif commodity == 'platinum':
+        price = get_metals_price('XPT')
+    elif commodity == 'copper':
+        price = get_metals_price('XCU')
+    elif commodity == 'oil':
+        price = get_oil_price()
+    else:
+        price = None
+
+    return price if price else fallback.get(commodity, 0)
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
 
 def get_latest_features(commodity: str) -> pd.DataFrame:
+    price = get_current_price(commodity)
+
     if commodity == 'gold':
         features = pd.DataFrame({
-            'gold_price': [3000],
-            'gold_ma_7': [2980],
-            'gold_ma_30': [2950],
-            'gold_ma_200': [2800],
+            'gold_price': [price],
+            'gold_ma_7': [price * 0.993],
+            'gold_ma_30': [price * 0.983],
+            'gold_ma_200': [price * 0.933],
             'gold_volatility': [50],
             'gold_roc': [0.02],
             'usd_zar': [18.5],
@@ -81,10 +136,10 @@ def get_latest_features(commodity: str) -> pd.DataFrame:
         })
     elif commodity == 'platinum':
         features = pd.DataFrame({
-            'platinum_price': [980],
-            'platinum_ma_7': [975],
-            'platinum_ma_30': [965],
-            'platinum_ma_200': [940],
+            'platinum_price': [price],
+            'platinum_ma_7': [price * 0.995],
+            'platinum_ma_30': [price * 0.985],
+            'platinum_ma_200': [price * 0.959],
             'platinum_volatility': [20],
             'platinum_roc': [0.015],
             'usd_zar': [18.5],
@@ -96,10 +151,10 @@ def get_latest_features(commodity: str) -> pd.DataFrame:
         })
     elif commodity == 'oil':
         features = pd.DataFrame({
-            'oil_price': [85.50],
-            'oil_ma_7': [85.00],
-            'oil_ma_30': [84.50],
-            'oil_ma_200': [82.00],
+            'oil_price': [price],
+            'oil_ma_7': [price * 0.994],
+            'oil_ma_30': [price * 0.988],
+            'oil_ma_200': [price * 0.959],
             'oil_volatility': [5.2],
             'oil_roc': [0.015],
             'usd_zar': [18.5],
@@ -111,10 +166,10 @@ def get_latest_features(commodity: str) -> pd.DataFrame:
         })
     elif commodity == 'copper':
         features = pd.DataFrame({
-            'copper_price': [4.50],
-            'copper_ma_7': [4.48],
-            'copper_ma_30': [4.42],
-            'copper_ma_200': [4.20],
+            'copper_price': [price],
+            'copper_ma_7': [price * 0.996],
+            'copper_ma_30': [price * 0.982],
+            'copper_ma_200': [price * 0.933],
             'copper_volatility': [0.15],
             'copper_roc': [0.012],
             'usd_zar': [18.5],
@@ -204,6 +259,10 @@ def generate_recommendations(commodity: str, signal: str, change_percent: float)
             ]
     return []
 
+# ============================================
+# API ENDPOINTS
+# ============================================
+
 @app.get('/')
 def home():
     return {
@@ -289,6 +348,8 @@ def get_dashboard():
 @app.get('/health')
 def health_check():
     return {'status': 'healthy', 'models_loaded': len(models)}
+
+
 
 
 # In[ ]:
