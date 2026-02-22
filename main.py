@@ -35,15 +35,11 @@ commodity_info = {
     'copper': {'name': 'Copper', 'unit': 'lb', 'currency': 'USD'},
 }
 
-# ============================================
-# API KEYS — set these in Railway Variables
-# ============================================
-GOLD_API_KEY = os.environ.get("GOLD_API_KEY")  # goldapi.io
-EIA_API_KEY = os.environ.get("EIA_API_KEY")    # eia.gov
 
-# ============================================
-# PYDANTIC MODELS
-# ============================================
+GOLD_API_KEY = os.environ.get("GOLD_API_KEY")  
+EIA_API_KEY = os.environ.get("EIA_API_KEY")   
+
+
 
 class PredictionRequest(BaseModel):
     commodity: str
@@ -66,9 +62,7 @@ class PredictionResponse(BaseModel):
 class DashboardResponse(BaseModel):
     commodities: list
 
-# ============================================
-# MINING FEATURE PYDANTIC MODELS
-# ============================================
+
 
 class GradeCalculatorRequest(BaseModel):
     commodity: str
@@ -94,9 +88,7 @@ class BudgetRequest(BaseModel):
     budgeted_price: float
     quantity: float
 
-# ============================================
-# LIVE PRICE FETCHERS
-# ============================================
+
 
 def get_metals_price(symbol: str) -> float:
     try:
@@ -142,9 +134,7 @@ def get_current_price(commodity: str):
     else:
         return fallback.get(commodity, 0), 'fallback'
 
-# ============================================
-# FIXED: REAL FEATURES FROM YFINANCE
-# ============================================
+
 
 def get_fallback_features(commodity: str, price: float) -> pd.DataFrame:
     """Fallback features when yfinance fails — uses price-based estimates"""
@@ -275,9 +265,7 @@ def get_latest_features(commodity: str, price: float) -> tuple:
         print(f"yfinance failed for {commodity}, using fallback features: {e}")
         return get_fallback_features(commodity, price), 'fallback'
 
-# ============================================
-# FIXED: REAL CONFIDENCE SCORE
-# ============================================
+
 
 def calculate_confidence(commodity: str, change_percent: float) -> float:
     """
@@ -294,9 +282,7 @@ def calculate_confidence(commodity: str, change_percent: float) -> float:
     volatility_penalty = min(abs(change_percent) * 0.02, 0.30)
     return round(max(base_confidence - volatility_penalty, 0.50), 2)
 
-# ============================================
-# HELPER FUNCTIONS
-# ============================================
+
 
 def generate_signal(change_percent: float) -> str:
     if change_percent > 5:
@@ -376,9 +362,7 @@ def generate_recommendations(commodity: str, signal: str, change_percent: float)
             ]
     return []
 
-# ============================================
-# API ENDPOINTS
-# ============================================
+
 
 @app.get('/')
 def home():
@@ -480,9 +464,7 @@ def get_dashboard():
 def health_check():
     return {'status': 'healthy', 'models_loaded': len(models)}
 
-# ============================================
-# MINING FEATURE ENDPOINTS
-# ============================================
+
 
 @app.post('/grade-calculator')
 def grade_calculator(request: GradeCalculatorRequest):
