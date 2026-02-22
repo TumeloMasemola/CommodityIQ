@@ -7,3 +7,4 @@ xgboost
 scikit-learn
 nest_asyncio
 yfinance>=0.2.0
+slowapi
