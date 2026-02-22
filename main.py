@@ -1,11 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
-
-
-
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -67,6 +62,34 @@ class PredictionResponse(BaseModel):
 
 class DashboardResponse(BaseModel):
     commodities: list
+
+# ============================================
+# NEW MINING FEATURE PYDANTIC MODELS
+# ============================================
+
+class GradeCalculatorRequest(BaseModel):
+    commodity: str
+    ore_grade: float       # percentage (%)
+    tonnage: float         # tons
+    recovery_rate: float   # percentage (%)
+
+class MarginTrackerRequest(BaseModel):
+    commodity: str
+    quantity: float
+    mining_cost: float
+    processing_cost: float
+    transport_cost: float
+    royalty_rate: float    # percentage (%)
+
+class RoyaltyRequest(BaseModel):
+    commodity: str
+    country: str
+    production_volume: float
+
+class BudgetRequest(BaseModel):
+    commodity: str
+    budgeted_price: float
+    quantity: float
 
 # ============================================
 # LIVE PRICE FETCHERS
@@ -260,7 +283,7 @@ def generate_recommendations(commodity: str, signal: str, change_percent: float)
     return []
 
 # ============================================
-# API ENDPOINTS
+# EXISTING API ENDPOINTS
 # ============================================
 
 @app.get('/')
@@ -349,11 +372,153 @@ def get_dashboard():
 def health_check():
     return {'status': 'healthy', 'models_loaded': len(models)}
 
+# ============================================
+# NEW MINING FEATURE ENDPOINTS
+# ============================================
+
+@app.post('/grade-calculator')
+def grade_calculator(request: GradeCalculatorRequest):
+    if request.commodity not in commodity_info:
+        raise HTTPException(status_code=400, detail="Commodity not supported.")
+
+    current_price = get_current_price(request.commodity)
+
+    # Metal output in kg
+    metal_output_kg = (request.ore_grade / 100) * request.tonnage * (request.recovery_rate / 100) * 1000
+
+    # Convert to oz if gold/platinum, keep kg for others
+    if request.commodity in ['gold', 'platinum']:
+        metal_output = metal_output_kg * 32.1507  # kg to troy oz
+        output_unit = 'oz'
+    else:
+        metal_output = metal_output_kg
+        output_unit = 'kg'
+
+    total_revenue = metal_output * current_price
+
+    return {
+        'commodity': request.commodity,
+        'ore_grade_percent': request.ore_grade,
+        'tonnage': request.tonnage,
+        'recovery_rate_percent': request.recovery_rate,
+        'metal_output': round(metal_output, 2),
+        'output_unit': output_unit,
+        'current_price': round(current_price, 2),
+        'total_revenue': round(total_revenue, 2)
+    }
 
 
+@app.post('/margin-tracker')
+def margin_tracker(request: MarginTrackerRequest):
+    if request.commodity not in commodity_info:
+        raise HTTPException(status_code=400, detail="Commodity not supported.")
 
-# In[ ]:
+    current_price = get_current_price(request.commodity)
+    gross_revenue = current_price * request.quantity
+    total_operating_costs = request.mining_cost + request.processing_cost + request.transport_cost
+    royalty_amount = gross_revenue * (request.royalty_rate / 100)
+    net_margin = gross_revenue - total_operating_costs - royalty_amount
+    margin_percent = (net_margin / gross_revenue) * 100 if gross_revenue > 0 else 0
+
+    return {
+        'commodity': request.commodity,
+        'quantity': request.quantity,
+        'current_price': round(current_price, 2),
+        'gross_revenue': round(gross_revenue, 2),
+        'mining_cost': round(request.mining_cost, 2),
+        'processing_cost': round(request.processing_cost, 2),
+        'transport_cost': round(request.transport_cost, 2),
+        'royalty_rate_percent': request.royalty_rate,
+        'royalty_amount': round(royalty_amount, 2),
+        'total_costs': round(total_operating_costs + royalty_amount, 2),
+        'net_margin': round(net_margin, 2),
+        'margin_percent': round(margin_percent, 2),
+        'status': 'profitable' if net_margin > 0 else 'loss'
+    }
 
 
+@app.post('/royalty-estimator')
+def royalty_estimator(request: RoyaltyRequest):
+    # Royalty rates by country and commodity (%)
+    royalty_rates = {
+        'south_africa': {'gold': 0.5,  'platinum': 0.5,  'copper': 0.5,  'oil': 0.5},
+        'australia':    {'gold': 2.5,  'platinum': 2.5,  'copper': 2.5,  'oil': 10.0},
+        'canada':       {'gold': 2.0,  'platinum': 2.0,  'copper': 2.0,  'oil': 5.0},
+        'drc':          {'gold': 3.5,  'platinum': 3.5,  'copper': 3.5,  'oil': 3.5},
+        'zambia':       {'gold': 6.0,  'platinum': 6.0,  'copper': 6.0,  'oil': 6.0},
+    }
+
+    country_key = request.country.lower().replace(' ', '_')
+    if country_key not in royalty_rates:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Country '{request.country}' not supported. Choose from: South Africa, Australia, Canada, DRC, Zambia"
+        )
+    if request.commodity not in royalty_rates[country_key]:
+        raise HTTPException(status_code=400, detail="Commodity not supported for this country.")
+
+    current_price = get_current_price(request.commodity)
+    rate = royalty_rates[country_key][request.commodity]
+    gross_revenue = current_price * request.production_volume
+    royalty_amount = gross_revenue * (rate / 100)
+
+    return {
+        'commodity': request.commodity,
+        'country': request.country,
+        'royalty_rate_percent': rate,
+        'current_price': round(current_price, 2),
+        'production_volume': request.production_volume,
+        'gross_revenue': round(gross_revenue, 2),
+        'royalty_amount': round(royalty_amount, 2),
+        'net_after_royalty': round(gross_revenue - royalty_amount, 2)
+    }
 
 
+@app.get('/breakeven/{commodity}')
+def breakeven_check(commodity: str, breakeven_price: float):
+    if commodity not in commodity_info:
+        raise HTTPException(status_code=400, detail="Commodity not supported.")
+
+    current_price = get_current_price(commodity)
+    margin = current_price - breakeven_price
+    margin_percent = (margin / breakeven_price) * 100 if breakeven_price > 0 else 0
+
+    return {
+        'commodity': commodity,
+        'current_price': round(current_price, 2),
+        'breakeven_price': round(breakeven_price, 2),
+        'margin': round(margin, 2),
+        'margin_percent': round(margin_percent, 2),
+        'status': 'profitable' if margin > 0 else 'loss'
+    }
+
+
+@app.post('/budget-tracker')
+def budget_tracker(request: BudgetRequest):
+    if request.commodity not in commodity_info:
+        raise HTTPException(status_code=400, detail="Commodity not supported.")
+
+    current_price = get_current_price(request.commodity)
+    budgeted_total = request.budgeted_price * request.quantity
+    actual_total = current_price * request.quantity
+    variance = actual_total - budgeted_total
+    variance_percent = (variance / budgeted_total) * 100 if budgeted_total > 0 else 0
+
+    if variance > 0:
+        status = 'over_budget'
+    elif variance < 0:
+        status = 'under_budget'
+    else:
+        status = 'on_budget'
+
+    return {
+        'commodity': request.commodity,
+        'budgeted_price': round(request.budgeted_price, 2),
+        'current_price': round(current_price, 2),
+        'quantity': request.quantity,
+        'budgeted_total': round(budgeted_total, 2),
+        'actual_total': round(actual_total, 2),
+        'variance': round(variance, 2),
+        'variance_percent': round(variance_percent, 2),
+        'status': status
+    }
