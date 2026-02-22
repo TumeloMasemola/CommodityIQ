@@ -1,32 +1,66 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, validator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import joblib
 import numpy as np
 import pandas as pd
 import requests
 import os
+import logging
 from datetime import datetime, timedelta
+from functools import lru_cache
+import time
 import yfinance as yf
 
-app = FastAPI(title="CommodityIQ API")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+limiter = Limiter(key_func=get_remote_address)
+
+app = FastAPI(
+    title="TerraXIQ API",
+    version="2.1.0",
+    docs_url=None,       # SECURITY: disable swagger docs in production
+    redoc_url=None       # SECURITY: disable redoc in production
+)
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['*'],
-    allow_methods=['*'],
-    allow_headers=['*']
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"]
 )
 
-models = {
-    'gold': joblib.load('gold_xgb_model.pkl'),
-    'platinum': joblib.load('platinum_xgb_model.pkl'),
-    'oil': joblib.load('oil_xgb_model.pkl'),
-    'copper': joblib.load('copper_xgb_model.pkl'),
-}
+
+try:
+    models = {
+        'gold': joblib.load('gold_xgb_model.pkl'),
+        'platinum': joblib.load('platinum_xgb_model.pkl'),
+        'oil': joblib.load('oil_xgb_model.pkl'),
+        'copper': joblib.load('copper_xgb_model.pkl'),
+    }
+    logger.info(f"Successfully loaded {len(models)} ML models")
+except Exception as e:
+    logger.error(f"Failed to load models: {e}")
+    models = {}
 
 commodity_info = {
     'gold': {'name': 'Gold', 'unit': 'oz', 'currency': 'USD'},
@@ -36,14 +70,32 @@ commodity_info = {
 }
 
 
-GOLD_API_KEY = os.environ.get("GOLD_API_KEY")  
-EIA_API_KEY = os.environ.get("EIA_API_KEY")   
+GOLD_API_KEY = os.environ.get("GOLD_API_KEY")
+EIA_API_KEY = os.environ.get("EIA_API_KEY")
+
+if not GOLD_API_KEY:
+    logger.warning("GOLD_API_KEY not set — will use fallback prices for metals")
+if not EIA_API_KEY:
+    logger.warning("EIA_API_KEY not set — will use fallback price for oil")
 
 
 
 class PredictionRequest(BaseModel):
     commodity: str
     forecast_days: int = 30
+
+    @validator('commodity')
+    def commodity_must_be_valid(cls, v):
+        valid = ['gold', 'platinum', 'oil', 'copper']
+        if v.lower() not in valid:
+            raise ValueError(f"Commodity must be one of: {valid}")
+        return v.lower()
+
+    @validator('forecast_days')
+    def forecast_days_must_be_valid(cls, v):
+        if v not in [7, 30, 60, 90]:
+            raise ValueError("forecast_days must be 7, 30, 60, or 90")
+        return v
 
 class PredictionResponse(BaseModel):
     commodity: str
@@ -62,13 +114,35 @@ class PredictionResponse(BaseModel):
 class DashboardResponse(BaseModel):
     commodities: list
 
-
-
 class GradeCalculatorRequest(BaseModel):
     commodity: str
-    ore_grade: float       # percentage (%)
-    tonnage: float         # tons
-    recovery_rate: float   # percentage (%)
+    ore_grade: float
+    tonnage: float
+    recovery_rate: float
+
+    @validator('commodity')
+    def commodity_must_be_valid(cls, v):
+        if v.lower() not in ['gold', 'platinum', 'oil', 'copper']:
+            raise ValueError("Invalid commodity")
+        return v.lower()
+
+    @validator('ore_grade')
+    def ore_grade_must_be_valid(cls, v):
+        if v <= 0 or v > 100:
+            raise ValueError("Ore grade must be between 0 and 100 percent")
+        return v
+
+    @validator('tonnage')
+    def tonnage_must_be_positive(cls, v):
+        if v <= 0 or v > 10_000_000:
+            raise ValueError("Tonnage must be positive and less than 10,000,000 tons")
+        return v
+
+    @validator('recovery_rate')
+    def recovery_rate_must_be_valid(cls, v):
+        if v <= 0 or v > 100:
+            raise ValueError("Recovery rate must be between 0 and 100 percent")
+        return v
 
 class MarginTrackerRequest(BaseModel):
     commodity: str
@@ -76,41 +150,131 @@ class MarginTrackerRequest(BaseModel):
     mining_cost: float
     processing_cost: float
     transport_cost: float
-    royalty_rate: float    # percentage (%)
+    royalty_rate: float
+
+    @validator('commodity')
+    def commodity_must_be_valid(cls, v):
+        if v.lower() not in ['gold', 'platinum', 'oil', 'copper']:
+            raise ValueError("Invalid commodity")
+        return v.lower()
+
+    @validator('quantity')
+    def quantity_must_be_positive(cls, v):
+        if v <= 0 or v > 10_000_000:
+            raise ValueError("Quantity must be positive")
+        return v
+
+    @validator('mining_cost', 'processing_cost', 'transport_cost')
+    def costs_must_be_non_negative(cls, v):
+        if v < 0 or v > 1_000_000_000:
+            raise ValueError("Cost values must be non-negative and realistic")
+        return v
+
+    @validator('royalty_rate')
+    def royalty_rate_must_be_valid(cls, v):
+        if v < 0 or v > 100:
+            raise ValueError("Royalty rate must be between 0 and 100 percent")
+        return v
 
 class RoyaltyRequest(BaseModel):
     commodity: str
     country: str
     production_volume: float
 
+    @validator('commodity')
+    def commodity_must_be_valid(cls, v):
+        if v.lower() not in ['gold', 'platinum', 'oil', 'copper']:
+            raise ValueError("Invalid commodity")
+        return v.lower()
+
+    @validator('production_volume')
+    def volume_must_be_positive(cls, v):
+        if v <= 0 or v > 10_000_000:
+            raise ValueError("Production volume must be positive")
+        return v
+
 class BudgetRequest(BaseModel):
     commodity: str
     budgeted_price: float
     quantity: float
 
+    @validator('commodity')
+    def commodity_must_be_valid(cls, v):
+        if v.lower() not in ['gold', 'platinum', 'oil', 'copper']:
+            raise ValueError("Invalid commodity")
+        return v.lower()
+
+    @validator('budgeted_price')
+    def price_must_be_positive(cls, v):
+        if v <= 0 or v > 1_000_000:
+            raise ValueError("Budgeted price must be positive and realistic")
+        return v
+
+    @validator('quantity')
+    def quantity_must_be_positive(cls, v):
+        if v <= 0 or v > 10_000_000:
+            raise ValueError("Quantity must be positive")
+        return v
+
+
+_price_cache = {}
+CACHE_TTL = 300  # 5 minutes
+
+def get_cached_price(commodity: str):
+    now = time.time()
+    if commodity in _price_cache:
+        cached_price, cached_time, cached_source = _price_cache[commodity]
+        if now - cached_time < CACHE_TTL:
+            logger.info(f"Using cached price for {commodity}")
+            return cached_price, cached_source
+    return None, None
+
+def set_cached_price(commodity: str, price: float, source: str):
+    _price_cache[commodity] = (price, time.time(), source)
+
 
 
 def get_metals_price(symbol: str) -> float:
+    if not GOLD_API_KEY:
+        return None
     try:
         response = requests.get(
             f"https://www.goldapi.io/api/{symbol}/USD",
             headers={"x-access-token": GOLD_API_KEY},
             timeout=5
         )
-        return float(response.json()['price'])
-    except:
+        response.raise_for_status()
+        data = response.json()
+        price = float(data['price'])
+        if price <= 0:
+            return None
+        return price
+    except Exception as e:
+        logger.error(f"Failed to fetch metals price for {symbol}: {e}")
         return None
 
 def get_oil_price() -> float:
+    if not EIA_API_KEY:
+        return None
     try:
         url = f"https://api.eia.gov/v2/petroleum/pri/spt/data/?api_key={EIA_API_KEY}&frequency=daily&data[0]=value&sort[0][column]=period&sort[0][direction]=desc&length=1"
         response = requests.get(url, timeout=5)
-        return float(response.json()['response']['data'][0]['value'])
-    except:
+        response.raise_for_status()
+        price = float(response.json()['response']['data'][0]['value'])
+        if price <= 0:
+            return None
+        return price
+    except Exception as e:
+        logger.error(f"Failed to fetch oil price: {e}")
         return None
 
 def get_current_price(commodity: str):
-    """Returns (price, data_source) tuple"""
+    """Returns (price, data_source) tuple with caching"""
+    # Check cache first
+    cached_price, cached_source = get_cached_price(commodity)
+    if cached_price:
+        return cached_price, cached_source
+
     fallback = {
         'gold': 2648,
         'platinum': 982,
@@ -130,93 +294,53 @@ def get_current_price(commodity: str):
         price = None
 
     if price:
+        set_cached_price(commodity, price, 'live')
         return price, 'live'
     else:
-        return fallback.get(commodity, 0), 'fallback'
+        fallback_price = fallback.get(commodity, 0)
+        logger.warning(f"Using fallback price for {commodity}: {fallback_price}")
+        return fallback_price, 'fallback'
 
 
 
 def get_fallback_features(commodity: str, price: float) -> pd.DataFrame:
-    """Fallback features when yfinance fails — uses price-based estimates"""
+    """Fallback features when yfinance fails"""
     if commodity == 'gold':
         return pd.DataFrame({
-            'gold_price': [price],
-            'gold_ma_7': [price * 0.993],
-            'gold_ma_30': [price * 0.983],
-            'gold_ma_200': [price * 0.933],
-            'gold_volatility': [50],
-            'gold_roc': [0.02],
-            'usd_zar': [18.5],
-            'usd_zar_ma_30': [18.3],
-            'usd_zar_change': [0.01],
-            'rsi': [62],
-            'month': [datetime.now().month],
-            'quarter': [datetime.now().quarter]
+            'gold_price': [price], 'gold_ma_7': [price * 0.993],
+            'gold_ma_30': [price * 0.983], 'gold_ma_200': [price * 0.933],
+            'gold_volatility': [50], 'gold_roc': [0.02],
+            'usd_zar': [18.5], 'usd_zar_ma_30': [18.3], 'usd_zar_change': [0.01],
+            'rsi': [62], 'month': [datetime.now().month], 'quarter': [datetime.now().quarter]
         })
     elif commodity == 'platinum':
         return pd.DataFrame({
-            'platinum_price': [price],
-            'platinum_ma_7': [price * 0.995],
-            'platinum_ma_30': [price * 0.985],
-            'platinum_ma_200': [price * 0.959],
-            'platinum_volatility': [20],
-            'platinum_roc': [0.015],
-            'usd_zar': [18.5],
-            'usd_zar_ma_30': [18.3],
-            'usd_zar_change': [0.01],
-            'rsi': [55],
-            'month': [datetime.now().month],
-            'quarter': [datetime.now().quarter]
+            'platinum_price': [price], 'platinum_ma_7': [price * 0.995],
+            'platinum_ma_30': [price * 0.985], 'platinum_ma_200': [price * 0.959],
+            'platinum_volatility': [20], 'platinum_roc': [0.015],
+            'usd_zar': [18.5], 'usd_zar_ma_30': [18.3], 'usd_zar_change': [0.01],
+            'rsi': [55], 'month': [datetime.now().month], 'quarter': [datetime.now().quarter]
         })
     elif commodity == 'oil':
         return pd.DataFrame({
-            'oil_price': [price],
-            'oil_ma_7': [price * 0.994],
-            'oil_ma_30': [price * 0.988],
-            'oil_ma_200': [price * 0.959],
-            'oil_volatility': [5.2],
-            'oil_roc': [0.015],
-            'usd_zar': [18.5],
-            'usd_zar_ma_30': [18.3],
-            'usd_zar_change': [0.005],
-            'rsi': [58],
-            'month': [datetime.now().month],
-            'quarter': [datetime.now().quarter]
+            'oil_price': [price], 'oil_ma_7': [price * 0.994],
+            'oil_ma_30': [price * 0.988], 'oil_ma_200': [price * 0.959],
+            'oil_volatility': [5.2], 'oil_roc': [0.015],
+            'usd_zar': [18.5], 'usd_zar_ma_30': [18.3], 'usd_zar_change': [0.005],
+            'rsi': [58], 'month': [datetime.now().month], 'quarter': [datetime.now().quarter]
         })
     elif commodity == 'copper':
         return pd.DataFrame({
-            'copper_price': [price],
-            'copper_ma_7': [price * 0.996],
-            'copper_ma_30': [price * 0.982],
-            'copper_ma_200': [price * 0.933],
-            'copper_volatility': [0.15],
-            'copper_roc': [0.012],
-            'usd_zar': [18.5],
-            'usd_zar_ma_30': [18.3],
-            'usd_zar_change': [0.01],
-            'rsi': [60],
-            'month': [datetime.now().month],
-            'quarter': [datetime.now().quarter]
+            'copper_price': [price], 'copper_ma_7': [price * 0.996],
+            'copper_ma_30': [price * 0.982], 'copper_ma_200': [price * 0.933],
+            'copper_volatility': [0.15], 'copper_roc': [0.012],
+            'usd_zar': [18.5], 'usd_zar_ma_30': [18.3], 'usd_zar_change': [0.01],
+            'rsi': [60], 'month': [datetime.now().month], 'quarter': [datetime.now().quarter]
         })
 
 def get_latest_features(commodity: str, price: float) -> tuple:
-    """
-    Returns (features_dataframe, features_source)
-    Tries yfinance first, falls back to estimates if it fails
-    """
-    symbol_map = {
-        'gold': 'GC=F',
-        'platinum': 'PL=F',
-        'copper': 'HG=F',
-        'oil': 'CL=F'
-    }
-
-    col_map = {
-        'gold': 'gold_price',
-        'platinum': 'platinum_price',
-        'copper': 'copper_price',
-        'oil': 'oil_price'
-    }
+    symbol_map = {'gold': 'GC=F', 'platinum': 'PL=F', 'copper': 'HG=F', 'oil': 'CL=F'}
+    col_map = {'gold': 'gold_price', 'platinum': 'platinum_price', 'copper': 'copper_price', 'oil': 'oil_price'}
 
     try:
         ticker = yf.download(symbol_map[commodity], period='7mo', interval='1d', progress=False)
@@ -228,10 +352,7 @@ def get_latest_features(commodity: str, price: float) -> tuple:
             zar.columns = zar.columns.get_level_values(0)
 
         price_col = col_map[commodity]
-        df = pd.DataFrame({
-            price_col: ticker['Close'],
-            'usd_zar': zar['Close']
-        }).dropna()
+        df = pd.DataFrame({price_col: ticker['Close'], 'usd_zar': zar['Close']}).dropna()
 
         df[f'{commodity}_ma_7'] = df[price_col].rolling(7).mean()
         df[f'{commodity}_ma_30'] = df[price_col].rolling(30).mean()
@@ -250,7 +371,7 @@ def get_latest_features(commodity: str, price: float) -> tuple:
         df = df.dropna()
 
         if len(df) == 0:
-            raise ValueError("Not enough data after calculations")
+            raise ValueError("Not enough data")
 
         feature_cols = [
             price_col, f'{commodity}_ma_7', f'{commodity}_ma_30',
@@ -258,123 +379,65 @@ def get_latest_features(commodity: str, price: float) -> tuple:
             f'{commodity}_roc', 'usd_zar', 'usd_zar_ma_30',
             'usd_zar_change', 'rsi', 'month', 'quarter'
         ]
-
         return df[feature_cols].iloc[-1:], 'live'
 
     except Exception as e:
-        print(f"yfinance failed for {commodity}, using fallback features: {e}")
+        logger.error(f"yfinance failed for {commodity}: {e}")
         return get_fallback_features(commodity, price), 'fallback'
 
 
 
 def calculate_confidence(commodity: str, change_percent: float) -> float:
-    """
-    Real confidence based on commodity reliability and predicted volatility.
-    Higher predicted change = less confidence (more uncertain).
-    """
-    base_confidence = {
-        'gold': 0.87,
-        'platinum': 0.82,
-        'copper': 0.79,
-        'oil': 0.75
-    }.get(commodity, 0.80)
-
+    base_confidence = {'gold': 0.87, 'platinum': 0.82, 'copper': 0.79, 'oil': 0.75}.get(commodity, 0.80)
     volatility_penalty = min(abs(change_percent) * 0.02, 0.30)
     return round(max(base_confidence - volatility_penalty, 0.50), 2)
 
-
-
 def generate_signal(change_percent: float) -> str:
-    if change_percent > 5:
-        return "STRONG BUY"
-    elif change_percent > 2:
-        return "BUY"
-    elif change_percent < -5:
-        return "STRONG SELL"
-    elif change_percent < -2:
-        return "SELL"
-    else:
-        return "HOLD"
+    if change_percent > 5: return "STRONG BUY"
+    elif change_percent > 2: return "BUY"
+    elif change_percent < -5: return "STRONG SELL"
+    elif change_percent < -2: return "SELL"
+    else: return "HOLD"
 
 def generate_recommendations(commodity: str, signal: str, change_percent: float) -> list:
     if commodity in ['gold', 'platinum']:
         if signal in ['BUY', 'STRONG BUY']:
-            return [
-                "Increase production immediately",
-                f"Expect {abs(change_percent):.1f}% price increase",
-                "Consider stockpiling refined metal",
-                "Hedge 50% of next quarter production"
-            ]
+            return ["Increase production immediately", f"Expect {abs(change_percent):.1f}% price increase", "Consider stockpiling refined metal", "Hedge 50% of next quarter production"]
         elif signal in ['SELL', 'STRONG SELL']:
-            return [
-                "Sell current stockpile NOW",
-                f"Prices may drop {abs(change_percent):.1f}%",
-                "Reduce production temporarily",
-                "Wait for market recovery"
-            ]
+            return ["Sell current stockpile NOW", f"Prices may drop {abs(change_percent):.1f}%", "Reduce production temporarily", "Wait for market recovery"]
         else:
-            return [
-                "Maintain current production levels",
-                "Market is stable - no urgent action",
-                "Monitor closely for changes"
-            ]
+            return ["Maintain current production levels", "Market is stable - no urgent action", "Monitor closely for changes"]
     elif commodity == 'oil':
         if signal in ['BUY', 'STRONG BUY']:
-            return [
-                "HEDGE fuel costs immediately!",
-                f"Oil may rise {abs(change_percent):.1f}%",
-                "Lock in current fuel contracts",
-                "Consider passing costs to customers"
-            ]
+            return ["HEDGE fuel costs immediately!", f"Oil may rise {abs(change_percent):.1f}%", "Lock in current fuel contracts", "Consider passing costs to customers"]
         elif signal in ['SELL', 'STRONG SELL']:
-            return [
-                "DO NOT HEDGE - wait for lower prices",
-                f"Oil costs may drop {abs(change_percent):.1f}%",
-                "Delay large fuel purchases",
-                "Use spot market instead of contracts"
-            ]
+            return ["DO NOT HEDGE - wait for lower prices", f"Oil costs may drop {abs(change_percent):.1f}%", "Delay large fuel purchases", "Use spot market instead of contracts"]
         else:
-            return [
-                "Normal purchasing patterns",
-                "Oil prices stable",
-                "No urgent hedging needed"
-            ]
+            return ["Normal purchasing patterns", "Oil prices stable", "No urgent hedging needed"]
     elif commodity == 'copper':
         if signal in ['BUY', 'STRONG BUY']:
-            return [
-                "Purchase copper NOW before price rise",
-                f"Prices rising {abs(change_percent):.1f}%",
-                "Lock in 6-month supply contracts",
-                "Start copper-intensive projects earlier"
-            ]
+            return ["Purchase copper NOW before price rise", f"Prices rising {abs(change_percent):.1f}%", "Lock in 6-month supply contracts", "Start copper-intensive projects earlier"]
         elif signal in ['SELL', 'STRONG SELL']:
-            return [
-                "WAIT to purchase copper",
-                f"Prices dropping {abs(change_percent):.1f}%",
-                "Delay non-urgent purchases",
-                "Negotiate lower prices with suppliers"
-            ]
+            return ["WAIT to purchase copper", f"Prices dropping {abs(change_percent):.1f}%", "Delay non-urgent purchases", "Negotiate lower prices with suppliers"]
         else:
-            return [
-                "Normal purchasing patterns",
-                "Copper prices stable",
-                "No urgency"
-            ]
+            return ["Normal purchasing patterns", "Copper prices stable", "No urgency"]
     return []
 
 
 
 @app.get('/')
-def home():
+@limiter.limit("30/minute")
+def home(request: Request):
     return {
-        'name': 'CommodityIQ API',
-        'version': '2.0.0',
+        'name': 'TerraXIQ API',
+        'version': '2.1.0',
         'status': 'running',
         'available_commodities': list(models.keys())
     }
 
 @app.get('/commodities')
-def list_commodities():
+@limiter.limit("30/minute")
+def list_commodities(request: Request):
     return {
         'commodities': [
             {'id': key, 'name': info['name'], 'unit': info['unit'], 'currency': info['currency']}
@@ -383,38 +446,33 @@ def list_commodities():
     }
 
 @app.post('/predict', response_model=PredictionResponse)
-def predict(request: PredictionRequest):
-    if request.commodity not in models:
-        raise HTTPException(status_code=400, detail=f"Commodity '{request.commodity}' not supported.")
-    if request.forecast_days not in [7, 30, 60, 90]:
-        raise HTTPException(status_code=400, detail="forecast_days must be 7, 30, 60, or 90")
+@limiter.limit("10/minute")
+def predict(request: Request, body: PredictionRequest):
+    if not models:
+        raise HTTPException(status_code=503, detail="ML models not loaded")
 
-    current_price, price_source = get_current_price(request.commodity)
-    features, features_source = get_latest_features(request.commodity, current_price)
-    predicted_price = models[request.commodity].predict(features)[0]
+    current_price, price_source = get_current_price(body.commodity)
+    features, features_source = get_latest_features(body.commodity, current_price)
+    predicted_price = float(models[body.commodity].predict(features)[0])
 
-    if request.forecast_days == 7:
+    if body.forecast_days == 7:
         predicted_price = current_price + (predicted_price - current_price) * 0.25
-    elif request.forecast_days == 60:
+    elif body.forecast_days == 60:
         predicted_price = current_price + (predicted_price - current_price) * 1.8
-    elif request.forecast_days == 90:
+    elif body.forecast_days == 90:
         predicted_price = current_price + (predicted_price - current_price) * 2.5
 
     change_amount = predicted_price - current_price
     change_percent = (change_amount / current_price) * 100
     signal = generate_signal(change_percent)
-    recommendations = generate_recommendations(request.commodity, signal, change_percent)
-    confidence = calculate_confidence(request.commodity, change_percent)
+    recommendations = generate_recommendations(body.commodity, signal, change_percent)
+    confidence = calculate_confidence(body.commodity, change_percent)
     current_date = datetime.now()
-    forecast_date = current_date + timedelta(days=request.forecast_days)
-
-    # Determine overall data source and warning
+    forecast_date = current_date + timedelta(days=body.forecast_days)
     is_live = price_source == 'live' and features_source == 'live'
-    data_source = 'live' if is_live else 'fallback'
-    warning = None if is_live else 'Some data is unavailable — using estimated values. Predictions may be less accurate.'
 
     return {
-        'commodity': request.commodity,
+        'commodity': body.commodity,
         'current_price': round(current_price, 2),
         'current_date': current_date.strftime('%Y-%m-%d'),
         'forecast_date': forecast_date.strftime('%Y-%m-%d'),
@@ -424,18 +482,22 @@ def predict(request: PredictionRequest):
         'signal': signal,
         'confidence': confidence,
         'recommendations': recommendations,
-        'data_source': data_source,
-        'warning': warning
+        'data_source': 'live' if is_live else 'fallback',
+        'warning': None if is_live else 'Some data is unavailable — using estimated values. Predictions may be less accurate.'
     }
 
 @app.get('/dashboard', response_model=DashboardResponse)
-def get_dashboard():
+@limiter.limit("10/minute")
+def get_dashboard(request: Request):
+    if not models:
+        raise HTTPException(status_code=503, detail="ML models not loaded")
+
     commodities_data = []
     for commodity_id in models.keys():
         try:
             current_price, price_source = get_current_price(commodity_id)
             features, features_source = get_latest_features(commodity_id, current_price)
-            predicted_price = models[commodity_id].predict(features)[0]
+            predicted_price = float(models[commodity_id].predict(features)[0])
             change_amount = predicted_price - current_price
             change_percent = (change_amount / current_price) * 100
             signal = generate_signal(change_percent)
@@ -456,26 +518,31 @@ def get_dashboard():
                 'warning': None if is_live else 'Using estimated data'
             })
         except Exception as e:
-            print(f"Error processing {commodity_id}: {e}")
+            logger.error(f"Error processing {commodity_id}: {e}")
             continue
     return {'commodities': commodities_data}
 
 @app.get('/health')
 def health_check():
-    return {'status': 'healthy', 'models_loaded': len(models)}
+    return {
+        'status': 'healthy',
+        'models_loaded': len(models),
+        'api_keys_configured': {
+            'gold_api': bool(GOLD_API_KEY),
+            'eia_api': bool(EIA_API_KEY)
+        }
+    }
 
 
 
 @app.post('/grade-calculator')
-def grade_calculator(request: GradeCalculatorRequest):
-    if request.commodity not in commodity_info:
-        raise HTTPException(status_code=400, detail="Commodity not supported.")
+@limiter.limit("20/minute")
+def grade_calculator(request: Request, body: GradeCalculatorRequest):
+    current_price, price_source = get_current_price(body.commodity)
+    metal_output_kg = (body.ore_grade / 100) * body.tonnage * (body.recovery_rate / 100) * 1000
 
-    current_price, price_source = get_current_price(request.commodity)
-    metal_output_kg = (request.ore_grade / 100) * request.tonnage * (request.recovery_rate / 100) * 1000
-
-    if request.commodity in ['gold', 'platinum']:
-        metal_output = metal_output_kg * 32.1507  # kg to troy oz
+    if body.commodity in ['gold', 'platinum']:
+        metal_output = metal_output_kg * 32.1507
         output_unit = 'oz'
     else:
         metal_output = metal_output_kg
@@ -484,10 +551,10 @@ def grade_calculator(request: GradeCalculatorRequest):
     total_revenue = metal_output * current_price
 
     return {
-        'commodity': request.commodity,
-        'ore_grade_percent': request.ore_grade,
-        'tonnage': request.tonnage,
-        'recovery_rate_percent': request.recovery_rate,
+        'commodity': body.commodity,
+        'ore_grade_percent': body.ore_grade,
+        'tonnage': body.tonnage,
+        'recovery_rate_percent': body.recovery_rate,
         'metal_output': round(metal_output, 2),
         'output_unit': output_unit,
         'current_price': round(current_price, 2),
@@ -496,28 +563,25 @@ def grade_calculator(request: GradeCalculatorRequest):
         'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'
     }
 
-
 @app.post('/margin-tracker')
-def margin_tracker(request: MarginTrackerRequest):
-    if request.commodity not in commodity_info:
-        raise HTTPException(status_code=400, detail="Commodity not supported.")
-
-    current_price, price_source = get_current_price(request.commodity)
-    gross_revenue = current_price * request.quantity
-    total_operating_costs = request.mining_cost + request.processing_cost + request.transport_cost
-    royalty_amount = gross_revenue * (request.royalty_rate / 100)
+@limiter.limit("20/minute")
+def margin_tracker(request: Request, body: MarginTrackerRequest):
+    current_price, price_source = get_current_price(body.commodity)
+    gross_revenue = current_price * body.quantity
+    total_operating_costs = body.mining_cost + body.processing_cost + body.transport_cost
+    royalty_amount = gross_revenue * (body.royalty_rate / 100)
     net_margin = gross_revenue - total_operating_costs - royalty_amount
     margin_percent = (net_margin / gross_revenue) * 100 if gross_revenue > 0 else 0
 
     return {
-        'commodity': request.commodity,
-        'quantity': request.quantity,
+        'commodity': body.commodity,
+        'quantity': body.quantity,
         'current_price': round(current_price, 2),
         'gross_revenue': round(gross_revenue, 2),
-        'mining_cost': round(request.mining_cost, 2),
-        'processing_cost': round(request.processing_cost, 2),
-        'transport_cost': round(request.transport_cost, 2),
-        'royalty_rate_percent': request.royalty_rate,
+        'mining_cost': round(body.mining_cost, 2),
+        'processing_cost': round(body.processing_cost, 2),
+        'transport_cost': round(body.transport_cost, 2),
+        'royalty_rate_percent': body.royalty_rate,
         'royalty_amount': round(royalty_amount, 2),
         'total_costs': round(total_operating_costs + royalty_amount, 2),
         'net_margin': round(net_margin, 2),
@@ -527,37 +591,32 @@ def margin_tracker(request: MarginTrackerRequest):
         'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'
     }
 
-
 @app.post('/royalty-estimator')
-def royalty_estimator(request: RoyaltyRequest):
+@limiter.limit("20/minute")
+def royalty_estimator(request: Request, body: RoyaltyRequest):
     royalty_rates = {
-        'south_africa': {'gold': 0.5,  'platinum': 0.5,  'copper': 0.5,  'oil': 0.5},
-        'australia':    {'gold': 2.5,  'platinum': 2.5,  'copper': 2.5,  'oil': 10.0},
-        'canada':       {'gold': 2.0,  'platinum': 2.0,  'copper': 2.0,  'oil': 5.0},
-        'drc':          {'gold': 3.5,  'platinum': 3.5,  'copper': 3.5,  'oil': 3.5},
-        'zambia':       {'gold': 6.0,  'platinum': 6.0,  'copper': 6.0,  'oil': 6.0},
+        'south_africa': {'gold': 0.5, 'platinum': 0.5, 'copper': 0.5, 'oil': 0.5},
+        'australia': {'gold': 2.5, 'platinum': 2.5, 'copper': 2.5, 'oil': 10.0},
+        'canada': {'gold': 2.0, 'platinum': 2.0, 'copper': 2.0, 'oil': 5.0},
+        'drc': {'gold': 3.5, 'platinum': 3.5, 'copper': 3.5, 'oil': 3.5},
+        'zambia': {'gold': 6.0, 'platinum': 6.0, 'copper': 6.0, 'oil': 6.0},
     }
 
-    country_key = request.country.lower().replace(' ', '_')
+    country_key = body.country.lower().replace(' ', '_')
     if country_key not in royalty_rates:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Country '{request.country}' not supported. Choose from: South Africa, Australia, Canada, DRC, Zambia"
-        )
-    if request.commodity not in royalty_rates[country_key]:
-        raise HTTPException(status_code=400, detail="Commodity not supported for this country.")
+        raise HTTPException(status_code=400, detail=f"Country not supported. Choose from: South Africa, Australia, Canada, DRC, Zambia")
 
-    current_price, price_source = get_current_price(request.commodity)
-    rate = royalty_rates[country_key][request.commodity]
-    gross_revenue = current_price * request.production_volume
+    current_price, price_source = get_current_price(body.commodity)
+    rate = royalty_rates[country_key][body.commodity]
+    gross_revenue = current_price * body.production_volume
     royalty_amount = gross_revenue * (rate / 100)
 
     return {
-        'commodity': request.commodity,
-        'country': request.country,
+        'commodity': body.commodity,
+        'country': body.country,
         'royalty_rate_percent': rate,
         'current_price': round(current_price, 2),
-        'production_volume': request.production_volume,
+        'production_volume': body.production_volume,
         'gross_revenue': round(gross_revenue, 2),
         'royalty_amount': round(royalty_amount, 2),
         'net_after_royalty': round(gross_revenue - royalty_amount, 2),
@@ -565,15 +624,17 @@ def royalty_estimator(request: RoyaltyRequest):
         'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'
     }
 
-
 @app.get('/breakeven/{commodity}')
-def breakeven_check(commodity: str, breakeven_price: float):
+@limiter.limit("20/minute")
+def breakeven_check(request: Request, commodity: str, breakeven_price: float):
     if commodity not in commodity_info:
         raise HTTPException(status_code=400, detail="Commodity not supported.")
+    if breakeven_price <= 0 or breakeven_price > 1_000_000:
+        raise HTTPException(status_code=400, detail="Break-even price must be a realistic positive number")
 
     current_price, price_source = get_current_price(commodity)
     margin = current_price - breakeven_price
-    margin_percent = (margin / breakeven_price) * 100 if breakeven_price > 0 else 0
+    margin_percent = (margin / breakeven_price) * 100
 
     return {
         'commodity': commodity,
@@ -586,30 +647,24 @@ def breakeven_check(commodity: str, breakeven_price: float):
         'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'
     }
 
-
 @app.post('/budget-tracker')
-def budget_tracker(request: BudgetRequest):
-    if request.commodity not in commodity_info:
-        raise HTTPException(status_code=400, detail="Commodity not supported.")
-
-    current_price, price_source = get_current_price(request.commodity)
-    budgeted_total = request.budgeted_price * request.quantity
-    actual_total = current_price * request.quantity
+@limiter.limit("20/minute")
+def budget_tracker(request: Request, body: BudgetRequest):
+    current_price, price_source = get_current_price(body.commodity)
+    budgeted_total = body.budgeted_price * body.quantity
+    actual_total = current_price * body.quantity
     variance = actual_total - budgeted_total
     variance_percent = (variance / budgeted_total) * 100 if budgeted_total > 0 else 0
 
-    if variance > 0:
-        status = 'over_budget'
-    elif variance < 0:
-        status = 'under_budget'
-    else:
-        status = 'on_budget'
+    if variance > 0: status = 'over_budget'
+    elif variance < 0: status = 'under_budget'
+    else: status = 'on_budget'
 
     return {
-        'commodity': request.commodity,
-        'budgeted_price': round(request.budgeted_price, 2),
+        'commodity': body.commodity,
+        'budgeted_price': round(body.budgeted_price, 2),
         'current_price': round(current_price, 2),
-        'quantity': request.quantity,
+        'quantity': body.quantity,
         'budgeted_total': round(budgeted_total, 2),
         'actual_total': round(actual_total, 2),
         'variance': round(variance, 2),
