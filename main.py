@@ -3,7 +3,6 @@
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -15,40 +14,24 @@ import requests
 import os
 import logging
 from datetime import datetime, timedelta
-from functools import lru_cache
 import time
 import yfinance as yf
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-
 limiter = Limiter(key_func=get_remote_address)
-
-app = FastAPI(
-    title="TerraXIQ API",
-    version="2.1.0",
-    docs_url=None,       # SECURITY: disable swagger docs in production
-    redoc_url=None       # SECURITY: disable redoc in production
-)
-
+app = FastAPI(title="TerraXIQ API", version="2.2.0", docs_url=None, redoc_url=None)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "Authorization"]
 )
-
 
 try:
     models = {
@@ -69,15 +52,13 @@ commodity_info = {
     'copper': {'name': 'Copper', 'unit': 'lb', 'currency': 'USD'},
 }
 
-
 GOLD_API_KEY = os.environ.get("GOLD_API_KEY")
 EIA_API_KEY = os.environ.get("EIA_API_KEY")
 
 if not GOLD_API_KEY:
-    logger.warning("GOLD_API_KEY not set — will use fallback prices for metals")
+    logger.warning("GOLD_API_KEY not set")
 if not EIA_API_KEY:
-    logger.warning("EIA_API_KEY not set — will use fallback price for oil")
-
+    logger.warning("EIA_API_KEY not set")
 
 
 class PredictionRequest(BaseModel):
@@ -218,20 +199,18 @@ class BudgetRequest(BaseModel):
 
 
 _price_cache = {}
-CACHE_TTL = 300  # 5 minutes
+CACHE_TTL = 300
 
 def get_cached_price(commodity: str):
     now = time.time()
     if commodity in _price_cache:
         cached_price, cached_time, cached_source = _price_cache[commodity]
         if now - cached_time < CACHE_TTL:
-            logger.info(f"Using cached price for {commodity}")
             return cached_price, cached_source
     return None, None
 
 def set_cached_price(commodity: str, price: float, source: str):
     _price_cache[commodity] = (price, time.time(), source)
-
 
 
 def get_metals_price(symbol: str) -> float:
@@ -244,11 +223,8 @@ def get_metals_price(symbol: str) -> float:
             timeout=5
         )
         response.raise_for_status()
-        data = response.json()
-        price = float(data['price'])
-        if price <= 0:
-            return None
-        return price
+        price = float(response.json()['price'])
+        return price if price > 0 else None
     except Exception as e:
         logger.error(f"Failed to fetch metals price for {symbol}: {e}")
         return None
@@ -261,26 +237,17 @@ def get_oil_price() -> float:
         response = requests.get(url, timeout=5)
         response.raise_for_status()
         price = float(response.json()['response']['data'][0]['value'])
-        if price <= 0:
-            return None
-        return price
+        return price if price > 0 else None
     except Exception as e:
         logger.error(f"Failed to fetch oil price: {e}")
         return None
 
 def get_current_price(commodity: str):
-    """Returns (price, data_source) tuple with caching"""
-    # Check cache first
     cached_price, cached_source = get_cached_price(commodity)
     if cached_price:
         return cached_price, cached_source
 
-    fallback = {
-        'gold': 2648,
-        'platinum': 982,
-        'oil': 78.65,
-        'copper': 4.28
-    }
+    fallback = {'gold': 2648, 'platinum': 982, 'oil': 78.65, 'copper': 4.28}
 
     if commodity == 'gold':
         price = get_metals_price('XAU')
@@ -302,41 +269,15 @@ def get_current_price(commodity: str):
         return fallback_price, 'fallback'
 
 
-
 def get_fallback_features(commodity: str, price: float) -> pd.DataFrame:
-    """Fallback features when yfinance fails"""
     if commodity == 'gold':
-        return pd.DataFrame({
-            'gold_price': [price], 'gold_ma_7': [price * 0.993],
-            'gold_ma_30': [price * 0.983], 'gold_ma_200': [price * 0.933],
-            'gold_volatility': [50], 'gold_roc': [0.02],
-            'usd_zar': [18.5], 'usd_zar_ma_30': [18.3], 'usd_zar_change': [0.01],
-            'rsi': [62], 'month': [datetime.now().month], 'quarter': [datetime.now().quarter]
-        })
+        return pd.DataFrame({'gold_price': [price], 'gold_ma_7': [price * 0.993], 'gold_ma_30': [price * 0.983], 'gold_ma_200': [price * 0.933], 'gold_volatility': [50], 'gold_roc': [0.02], 'usd_zar': [18.5], 'usd_zar_ma_30': [18.3], 'usd_zar_change': [0.01], 'rsi': [62], 'month': [datetime.now().month], 'quarter': [datetime.now().quarter]})
     elif commodity == 'platinum':
-        return pd.DataFrame({
-            'platinum_price': [price], 'platinum_ma_7': [price * 0.995],
-            'platinum_ma_30': [price * 0.985], 'platinum_ma_200': [price * 0.959],
-            'platinum_volatility': [20], 'platinum_roc': [0.015],
-            'usd_zar': [18.5], 'usd_zar_ma_30': [18.3], 'usd_zar_change': [0.01],
-            'rsi': [55], 'month': [datetime.now().month], 'quarter': [datetime.now().quarter]
-        })
+        return pd.DataFrame({'platinum_price': [price], 'platinum_ma_7': [price * 0.995], 'platinum_ma_30': [price * 0.985], 'platinum_ma_200': [price * 0.959], 'platinum_volatility': [20], 'platinum_roc': [0.015], 'usd_zar': [18.5], 'usd_zar_ma_30': [18.3], 'usd_zar_change': [0.01], 'rsi': [55], 'month': [datetime.now().month], 'quarter': [datetime.now().quarter]})
     elif commodity == 'oil':
-        return pd.DataFrame({
-            'oil_price': [price], 'oil_ma_7': [price * 0.994],
-            'oil_ma_30': [price * 0.988], 'oil_ma_200': [price * 0.959],
-            'oil_volatility': [5.2], 'oil_roc': [0.015],
-            'usd_zar': [18.5], 'usd_zar_ma_30': [18.3], 'usd_zar_change': [0.005],
-            'rsi': [58], 'month': [datetime.now().month], 'quarter': [datetime.now().quarter]
-        })
+        return pd.DataFrame({'oil_price': [price], 'oil_ma_7': [price * 0.994], 'oil_ma_30': [price * 0.988], 'oil_ma_200': [price * 0.959], 'oil_volatility': [5.2], 'oil_roc': [0.015], 'usd_zar': [18.5], 'usd_zar_ma_30': [18.3], 'usd_zar_change': [0.005], 'rsi': [58], 'month': [datetime.now().month], 'quarter': [datetime.now().quarter]})
     elif commodity == 'copper':
-        return pd.DataFrame({
-            'copper_price': [price], 'copper_ma_7': [price * 0.996],
-            'copper_ma_30': [price * 0.982], 'copper_ma_200': [price * 0.933],
-            'copper_volatility': [0.15], 'copper_roc': [0.012],
-            'usd_zar': [18.5], 'usd_zar_ma_30': [18.3], 'usd_zar_change': [0.01],
-            'rsi': [60], 'month': [datetime.now().month], 'quarter': [datetime.now().quarter]
-        })
+        return pd.DataFrame({'copper_price': [price], 'copper_ma_7': [price * 0.996], 'copper_ma_30': [price * 0.982], 'copper_ma_200': [price * 0.933], 'copper_volatility': [0.15], 'copper_roc': [0.012], 'usd_zar': [18.5], 'usd_zar_ma_30': [18.3], 'usd_zar_change': [0.01], 'rsi': [60], 'month': [datetime.now().month], 'quarter': [datetime.now().quarter]})
 
 def get_latest_features(commodity: str, price: float) -> tuple:
     symbol_map = {'gold': 'GC=F', 'platinum': 'PL=F', 'copper': 'HG=F', 'oil': 'CL=F'}
@@ -353,7 +294,6 @@ def get_latest_features(commodity: str, price: float) -> tuple:
 
         price_col = col_map[commodity]
         df = pd.DataFrame({price_col: ticker['Close'], 'usd_zar': zar['Close']}).dropna()
-
         df[f'{commodity}_ma_7'] = df[price_col].rolling(7).mean()
         df[f'{commodity}_ma_30'] = df[price_col].rolling(30).mean()
         df[f'{commodity}_ma_200'] = df[price_col].rolling(200).mean()
@@ -361,7 +301,6 @@ def get_latest_features(commodity: str, price: float) -> tuple:
         df[f'{commodity}_roc'] = df[price_col].pct_change(30, fill_method=None)
         df['usd_zar_ma_30'] = df['usd_zar'].rolling(30).mean()
         df['usd_zar_change'] = df['usd_zar'].pct_change(30, fill_method=None)
-
         delta = df[price_col].diff()
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = -delta.clip(upper=0).rolling(14).mean()
@@ -373,18 +312,12 @@ def get_latest_features(commodity: str, price: float) -> tuple:
         if len(df) == 0:
             raise ValueError("Not enough data")
 
-        feature_cols = [
-            price_col, f'{commodity}_ma_7', f'{commodity}_ma_30',
-            f'{commodity}_ma_200', f'{commodity}_volatility',
-            f'{commodity}_roc', 'usd_zar', 'usd_zar_ma_30',
-            'usd_zar_change', 'rsi', 'month', 'quarter'
-        ]
+        feature_cols = [price_col, f'{commodity}_ma_7', f'{commodity}_ma_30', f'{commodity}_ma_200', f'{commodity}_volatility', f'{commodity}_roc', 'usd_zar', 'usd_zar_ma_30', 'usd_zar_change', 'rsi', 'month', 'quarter']
         return df[feature_cols].iloc[-1:], 'live'
 
     except Exception as e:
         logger.error(f"yfinance failed for {commodity}: {e}")
         return get_fallback_features(commodity, price), 'fallback'
-
 
 
 def calculate_confidence(commodity: str, change_percent: float) -> float:
@@ -424,44 +357,30 @@ def generate_recommendations(commodity: str, signal: str, change_percent: float)
     return []
 
 
-
 @app.get('/')
 @limiter.limit("30/minute")
 def home(request: Request):
-    return {
-        'name': 'TerraXIQ API',
-        'version': '2.1.0',
-        'status': 'running',
-        'available_commodities': list(models.keys())
-    }
+    return {'name': 'TerraXIQ API', 'version': '2.2.0', 'status': 'running', 'available_commodities': list(models.keys())}
 
 @app.get('/commodities')
 @limiter.limit("30/minute")
 def list_commodities(request: Request):
-    return {
-        'commodities': [
-            {'id': key, 'name': info['name'], 'unit': info['unit'], 'currency': info['currency']}
-            for key, info in commodity_info.items()
-        ]
-    }
+    return {'commodities': [{'id': key, 'name': info['name'], 'unit': info['unit'], 'currency': info['currency']} for key, info in commodity_info.items()]}
 
 @app.post('/predict', response_model=PredictionResponse)
 @limiter.limit("10/minute")
 def predict(request: Request, body: PredictionRequest):
     if not models:
         raise HTTPException(status_code=503, detail="ML models not loaded")
-
     current_price, price_source = get_current_price(body.commodity)
     features, features_source = get_latest_features(body.commodity, current_price)
     predicted_price = float(models[body.commodity].predict(features)[0])
-
     if body.forecast_days == 7:
         predicted_price = current_price + (predicted_price - current_price) * 0.25
     elif body.forecast_days == 60:
         predicted_price = current_price + (predicted_price - current_price) * 1.8
     elif body.forecast_days == 90:
         predicted_price = current_price + (predicted_price - current_price) * 2.5
-
     change_amount = predicted_price - current_price
     change_percent = (change_amount / current_price) * 100
     signal = generate_signal(change_percent)
@@ -470,28 +389,13 @@ def predict(request: Request, body: PredictionRequest):
     current_date = datetime.now()
     forecast_date = current_date + timedelta(days=body.forecast_days)
     is_live = price_source == 'live' and features_source == 'live'
-
-    return {
-        'commodity': body.commodity,
-        'current_price': round(current_price, 2),
-        'current_date': current_date.strftime('%Y-%m-%d'),
-        'forecast_date': forecast_date.strftime('%Y-%m-%d'),
-        'predicted_price': round(predicted_price, 2),
-        'change_amount': round(change_amount, 2),
-        'change_percent': round(change_percent, 2),
-        'signal': signal,
-        'confidence': confidence,
-        'recommendations': recommendations,
-        'data_source': 'live' if is_live else 'fallback',
-        'warning': None if is_live else 'Some data is unavailable — using estimated values. Predictions may be less accurate.'
-    }
+    return {'commodity': body.commodity, 'current_price': round(current_price, 2), 'current_date': current_date.strftime('%Y-%m-%d'), 'forecast_date': forecast_date.strftime('%Y-%m-%d'), 'predicted_price': round(predicted_price, 2), 'change_amount': round(change_amount, 2), 'change_percent': round(change_percent, 2), 'signal': signal, 'confidence': confidence, 'recommendations': recommendations, 'data_source': 'live' if is_live else 'fallback', 'warning': None if is_live else 'Some data is unavailable — using estimated values. Predictions may be less accurate.'}
 
 @app.get('/dashboard', response_model=DashboardResponse)
 @limiter.limit("10/minute")
 def get_dashboard(request: Request):
     if not models:
         raise HTTPException(status_code=503, detail="ML models not loaded")
-
     commodities_data = []
     for commodity_id in models.keys():
         try:
@@ -503,20 +407,7 @@ def get_dashboard(request: Request):
             signal = generate_signal(change_percent)
             confidence = calculate_confidence(commodity_id, change_percent)
             is_live = price_source == 'live' and features_source == 'live'
-
-            commodities_data.append({
-                'id': commodity_id,
-                'name': commodity_info[commodity_id]['name'],
-                'current_price': round(current_price, 2),
-                'predicted_price_30d': round(predicted_price, 2),
-                'change_percent_30d': round(change_percent, 2),
-                'signal': signal,
-                'confidence': confidence,
-                'unit': commodity_info[commodity_id]['unit'],
-                'currency': commodity_info[commodity_id]['currency'],
-                'data_source': 'live' if is_live else 'fallback',
-                'warning': None if is_live else 'Using estimated data'
-            })
+            commodities_data.append({'id': commodity_id, 'name': commodity_info[commodity_id]['name'], 'current_price': round(current_price, 2), 'predicted_price_30d': round(predicted_price, 2), 'change_percent_30d': round(change_percent, 2), 'signal': signal, 'confidence': confidence, 'unit': commodity_info[commodity_id]['unit'], 'currency': commodity_info[commodity_id]['currency'], 'data_source': 'live' if is_live else 'fallback', 'warning': None if is_live else 'Using estimated data'})
         except Exception as e:
             logger.error(f"Error processing {commodity_id}: {e}")
             continue
@@ -524,15 +415,7 @@ def get_dashboard(request: Request):
 
 @app.get('/health')
 def health_check():
-    return {
-        'status': 'healthy',
-        'models_loaded': len(models),
-        'api_keys_configured': {
-            'gold_api': bool(GOLD_API_KEY),
-            'eia_api': bool(EIA_API_KEY)
-        }
-    }
-
+    return {'status': 'healthy', 'version': '2.2.0', 'models_loaded': len(models), 'api_keys_configured': {'gold_api': bool(GOLD_API_KEY), 'eia_api': bool(EIA_API_KEY)}}
 
 
 @app.post('/grade-calculator')
@@ -540,28 +423,14 @@ def health_check():
 def grade_calculator(request: Request, body: GradeCalculatorRequest):
     current_price, price_source = get_current_price(body.commodity)
     metal_output_kg = (body.ore_grade / 100) * body.tonnage * (body.recovery_rate / 100) * 1000
-
     if body.commodity in ['gold', 'platinum']:
         metal_output = metal_output_kg * 32.1507
         output_unit = 'oz'
     else:
         metal_output = metal_output_kg
         output_unit = 'kg'
-
     total_revenue = metal_output * current_price
-
-    return {
-        'commodity': body.commodity,
-        'ore_grade_percent': body.ore_grade,
-        'tonnage': body.tonnage,
-        'recovery_rate_percent': body.recovery_rate,
-        'metal_output': round(metal_output, 2),
-        'output_unit': output_unit,
-        'current_price': round(current_price, 2),
-        'total_revenue': round(total_revenue, 2),
-        'data_source': price_source,
-        'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'
-    }
+    return {'commodity': body.commodity, 'ore_grade_percent': body.ore_grade, 'tonnage': body.tonnage, 'recovery_rate_percent': body.recovery_rate, 'metal_output': round(metal_output, 2), 'output_unit': output_unit, 'current_price': round(current_price, 2), 'total_revenue': round(total_revenue, 2), 'data_source': price_source, 'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'}
 
 @app.post('/margin-tracker')
 @limiter.limit("20/minute")
@@ -572,57 +441,20 @@ def margin_tracker(request: Request, body: MarginTrackerRequest):
     royalty_amount = gross_revenue * (body.royalty_rate / 100)
     net_margin = gross_revenue - total_operating_costs - royalty_amount
     margin_percent = (net_margin / gross_revenue) * 100 if gross_revenue > 0 else 0
-
-    return {
-        'commodity': body.commodity,
-        'quantity': body.quantity,
-        'current_price': round(current_price, 2),
-        'gross_revenue': round(gross_revenue, 2),
-        'mining_cost': round(body.mining_cost, 2),
-        'processing_cost': round(body.processing_cost, 2),
-        'transport_cost': round(body.transport_cost, 2),
-        'royalty_rate_percent': body.royalty_rate,
-        'royalty_amount': round(royalty_amount, 2),
-        'total_costs': round(total_operating_costs + royalty_amount, 2),
-        'net_margin': round(net_margin, 2),
-        'margin_percent': round(margin_percent, 2),
-        'status': 'profitable' if net_margin > 0 else 'loss',
-        'data_source': price_source,
-        'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'
-    }
+    return {'commodity': body.commodity, 'quantity': body.quantity, 'current_price': round(current_price, 2), 'gross_revenue': round(gross_revenue, 2), 'mining_cost': round(body.mining_cost, 2), 'processing_cost': round(body.processing_cost, 2), 'transport_cost': round(body.transport_cost, 2), 'royalty_rate_percent': body.royalty_rate, 'royalty_amount': round(royalty_amount, 2), 'total_costs': round(total_operating_costs + royalty_amount, 2), 'net_margin': round(net_margin, 2), 'margin_percent': round(margin_percent, 2), 'status': 'profitable' if net_margin > 0 else 'loss', 'data_source': price_source, 'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'}
 
 @app.post('/royalty-estimator')
 @limiter.limit("20/minute")
 def royalty_estimator(request: Request, body: RoyaltyRequest):
-    royalty_rates = {
-        'south_africa': {'gold': 0.5, 'platinum': 0.5, 'copper': 0.5, 'oil': 0.5},
-        'australia': {'gold': 2.5, 'platinum': 2.5, 'copper': 2.5, 'oil': 10.0},
-        'canada': {'gold': 2.0, 'platinum': 2.0, 'copper': 2.0, 'oil': 5.0},
-        'drc': {'gold': 3.5, 'platinum': 3.5, 'copper': 3.5, 'oil': 3.5},
-        'zambia': {'gold': 6.0, 'platinum': 6.0, 'copper': 6.0, 'oil': 6.0},
-    }
-
+    royalty_rates = {'south_africa': {'gold': 0.5, 'platinum': 0.5, 'copper': 0.5, 'oil': 0.5}, 'australia': {'gold': 2.5, 'platinum': 2.5, 'copper': 2.5, 'oil': 10.0}, 'canada': {'gold': 2.0, 'platinum': 2.0, 'copper': 2.0, 'oil': 5.0}, 'drc': {'gold': 3.5, 'platinum': 3.5, 'copper': 3.5, 'oil': 3.5}, 'zambia': {'gold': 6.0, 'platinum': 6.0, 'copper': 6.0, 'oil': 6.0}}
     country_key = body.country.lower().replace(' ', '_')
     if country_key not in royalty_rates:
-        raise HTTPException(status_code=400, detail=f"Country not supported. Choose from: South Africa, Australia, Canada, DRC, Zambia")
-
+        raise HTTPException(status_code=400, detail="Country not supported. Choose from: South Africa, Australia, Canada, DRC, Zambia")
     current_price, price_source = get_current_price(body.commodity)
     rate = royalty_rates[country_key][body.commodity]
     gross_revenue = current_price * body.production_volume
     royalty_amount = gross_revenue * (rate / 100)
-
-    return {
-        'commodity': body.commodity,
-        'country': body.country,
-        'royalty_rate_percent': rate,
-        'current_price': round(current_price, 2),
-        'production_volume': body.production_volume,
-        'gross_revenue': round(gross_revenue, 2),
-        'royalty_amount': round(royalty_amount, 2),
-        'net_after_royalty': round(gross_revenue - royalty_amount, 2),
-        'data_source': price_source,
-        'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'
-    }
+    return {'commodity': body.commodity, 'country': body.country, 'royalty_rate_percent': rate, 'current_price': round(current_price, 2), 'production_volume': body.production_volume, 'gross_revenue': round(gross_revenue, 2), 'royalty_amount': round(royalty_amount, 2), 'net_after_royalty': round(gross_revenue - royalty_amount, 2), 'data_source': price_source, 'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'}
 
 @app.get('/breakeven/{commodity}')
 @limiter.limit("20/minute")
@@ -631,21 +463,10 @@ def breakeven_check(request: Request, commodity: str, breakeven_price: float):
         raise HTTPException(status_code=400, detail="Commodity not supported.")
     if breakeven_price <= 0 or breakeven_price > 1_000_000:
         raise HTTPException(status_code=400, detail="Break-even price must be a realistic positive number")
-
     current_price, price_source = get_current_price(commodity)
     margin = current_price - breakeven_price
     margin_percent = (margin / breakeven_price) * 100
-
-    return {
-        'commodity': commodity,
-        'current_price': round(current_price, 2),
-        'breakeven_price': round(breakeven_price, 2),
-        'margin': round(margin, 2),
-        'margin_percent': round(margin_percent, 2),
-        'status': 'profitable' if margin > 0 else 'loss',
-        'data_source': price_source,
-        'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'
-    }
+    return {'commodity': commodity, 'current_price': round(current_price, 2), 'breakeven_price': round(breakeven_price, 2), 'margin': round(margin, 2), 'margin_percent': round(margin_percent, 2), 'status': 'profitable' if margin > 0 else 'loss', 'data_source': price_source, 'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'}
 
 @app.post('/budget-tracker')
 @limiter.limit("20/minute")
@@ -655,21 +476,53 @@ def budget_tracker(request: Request, body: BudgetRequest):
     actual_total = current_price * body.quantity
     variance = actual_total - budgeted_total
     variance_percent = (variance / budgeted_total) * 100 if budgeted_total > 0 else 0
-
     if variance > 0: status = 'over_budget'
     elif variance < 0: status = 'under_budget'
     else: status = 'on_budget'
+    return {'commodity': body.commodity, 'budgeted_price': round(body.budgeted_price, 2), 'current_price': round(current_price, 2), 'quantity': body.quantity, 'budgeted_total': round(budgeted_total, 2), 'actual_total': round(actual_total, 2), 'variance': round(variance, 2), 'variance_percent': round(variance_percent, 2), 'status': status, 'data_source': price_source, 'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'}
 
-    return {
-        'commodity': body.commodity,
-        'budgeted_price': round(body.budgeted_price, 2),
-        'current_price': round(current_price, 2),
-        'quantity': body.quantity,
-        'budgeted_total': round(budgeted_total, 2),
-        'actual_total': round(actual_total, 2),
-        'variance': round(variance, 2),
-        'variance_percent': round(variance_percent, 2),
-        'status': status,
-        'data_source': price_source,
-        'warning': None if price_source == 'live' else 'Using fallback price — live price unavailable'
-    }
+
+@app.get('/price-history/{commodity}')
+@limiter.limit("20/minute")
+def price_history(request: Request, commodity: str, period: str = '1mo'):
+    if commodity not in commodity_info:
+        raise HTTPException(status_code=400, detail="Commodity not supported.")
+    valid_periods = ['1wk', '1mo', '3mo', '6mo', '1y']
+    if period not in valid_periods:
+        raise HTTPException(status_code=400, detail=f"Period must be one of: {valid_periods}")
+    symbol_map = {'gold': 'GC=F', 'platinum': 'PL=F', 'copper': 'HG=F', 'oil': 'CL=F'}
+    try:
+        ticker = yf.download(symbol_map[commodity], period=period, interval='1d', progress=False)
+        if isinstance(ticker.columns, pd.MultiIndex):
+            ticker.columns = ticker.columns.get_level_values(0)
+        if ticker.empty:
+            raise ValueError("No data returned from yfinance")
+        history = []
+        for date, row in ticker.iterrows():
+            history.append({'date': date.strftime('%Y-%m-%d'), 'open': round(float(row['Open']), 2), 'high': round(float(row['High']), 2), 'low': round(float(row['Low']), 2), 'close': round(float(row['Close']), 2)})
+        return {'commodity': commodity, 'commodity_name': commodity_info[commodity]['name'], 'period': period, 'data_points': len(history), 'history': history}
+    except Exception as e:
+        logger.error(f"Price history failed for {commodity}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch price history for {commodity}")
+
+
+@app.get('/exchange-rate')
+@limiter.limit("30/minute")
+def exchange_rate(request: Request):
+    try:
+        cached_price, cached_source = get_cached_price('usd_zar')
+        if cached_price:
+            return {'usd_zar': cached_price, 'source': 'cached', 'updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        zar = yf.download('ZAR=X', period='1d', interval='1m', progress=False)
+        if isinstance(zar.columns, pd.MultiIndex):
+            zar.columns = zar.columns.get_level_values(0)
+        if zar.empty:
+            raise ValueError("No exchange rate data returned")
+        rate = round(float(zar['Close'].iloc[-1]), 4)
+        if rate <= 0:
+            raise ValueError("Invalid exchange rate")
+        set_cached_price('usd_zar', rate, 'live')
+        return {'usd_zar': rate, 'source': 'live', 'updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    except Exception as e:
+        logger.error(f"Exchange rate fetch failed: {e}")
+        return {'usd_zar': 18.50, 'source': 'fallback', 'updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'warning': 'Live rate unavailable — using fallback rate of 18.50'}
